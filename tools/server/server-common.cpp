@@ -1125,11 +1125,225 @@ static void handle_media(
     }
 }
 
+struct da_auto_chunk_group {
+    size_t first_message;
+    size_t after_message;
+    int32_t n_tokens;
+};
+
+struct da_auto_chunk_marker {
+    std::string start;
+    std::string end;
+    size_t start_pos;
+    size_t end_pos;
+};
+
+static int32_t da_auto_char_to_token(const std::vector<size_t> & offsets, size_t pos) {
+    if (offsets.empty()) {
+        return -1;
+    }
+    const auto it = std::lower_bound(offsets.begin(), offsets.end(), pos);
+    if (it == offsets.begin()) {
+        return 0;
+    }
+    if (it == offsets.end()) {
+        return (int32_t) (offsets.size() - 1);
+    }
+    const size_t before = *(it - 1);
+    const size_t after = *it;
+    return (int32_t) (pos - before <= after - pos ? it - offsets.begin() - 1 : it - offsets.begin());
+}
+
+static bool da_auto_chunk_chat(
+        const llama_vocab * vocab,
+        const server_chat_params & opt,
+        common_chat_templates_inputs & inputs,
+        common_chat_params & chat_params,
+        std::vector<std::pair<int32_t, int32_t>> & da_chunks) {
+    if (!opt.da_auto || !vocab || inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE) {
+        return false;
+    }
+
+    for (const auto & message : inputs.messages) {
+        if (!message.content_parts.empty()) {
+            return false;
+        }
+    }
+
+    std::vector<size_t> user_messages;
+    for (size_t i = 0; i < inputs.messages.size(); ++i) {
+        if (inputs.messages[i].role == "user") {
+            user_messages.push_back(i);
+        }
+    }
+    if (user_messages.size() < 2) {
+        return false;
+    }
+
+    const common_chat_params original = common_chat_templates_apply(opt.tmpls.get(), inputs);
+    const llama_tokens original_tokens = common_tokenize(vocab, original.prompt, true, true);
+    if ((int64_t) original_tokens.size() < opt.da_auto_min_ctx) {
+        return false;
+    }
+
+    std::vector<da_auto_chunk_group> turns;
+    for (size_t i = 0; i + 1 < user_messages.size(); ++i) {
+        const size_t first = user_messages[i];
+        const size_t after = user_messages[i + 1];
+        int32_t n_tokens = 0;
+        for (size_t j = first; j < after; ++j) {
+            const auto & message = inputs.messages[j];
+            n_tokens += (int32_t) common_tokenize(vocab, message.content, false, true).size();
+            n_tokens += (int32_t) common_tokenize(vocab, message.reasoning_content, false, true).size();
+        }
+        turns.push_back({ first, after, n_tokens });
+    }
+    if (turns.empty()) {
+        return false;
+    }
+
+    std::vector<da_auto_chunk_group> groups;
+    size_t group_first = turns.front().first_message;
+    size_t group_after = group_first;
+    int32_t group_tokens = 0;
+    for (const auto & turn : turns) {
+        if (group_tokens > 0 && group_tokens + turn.n_tokens > opt.da_auto_chunk_tokens) {
+            groups.push_back({ group_first, group_after, group_tokens });
+            group_first = turn.first_message;
+            group_tokens = 0;
+        }
+        group_after = turn.after_message;
+        group_tokens += turn.n_tokens;
+        if (group_tokens >= opt.da_auto_chunk_tokens) {
+            groups.push_back({ group_first, group_after, group_tokens });
+            group_first = group_after;
+            group_tokens = 0;
+        }
+    }
+    if (group_tokens > 0) {
+        groups.push_back({ group_first, group_after, group_tokens });
+    }
+    if (groups.empty()) {
+        return false;
+    }
+
+    common_chat_templates_inputs auto_inputs = inputs;
+    static const std::string da_instruction =
+        "Older conversation turns may be labeled [Magic Chunk N]. Before relying on a chunk, emit "
+        "<focus magic_chunks=\"N\"> on its own line. Use <local> when only the current exchange is needed. "
+        "Emit <global> on its own line when you need to restore access to the full history. These control "
+        "tags are removed from the response.";
+    auto system = std::find_if(auto_inputs.messages.begin(), auto_inputs.messages.end(), [](const common_chat_msg & message) {
+        return message.role == "system";
+    });
+    if (system != auto_inputs.messages.end()) {
+        system->content = da_instruction + "\n\n" + system->content;
+    } else {
+        auto current_user = std::find_if(auto_inputs.messages.rbegin(), auto_inputs.messages.rend(), [](const common_chat_msg & message) {
+            return message.role == "user";
+        });
+        if (current_user == auto_inputs.messages.rend()) {
+            return false;
+        }
+        current_user->content = da_instruction + "\n\n" + current_user->content;
+    }
+
+    std::vector<da_auto_chunk_marker> markers;
+    markers.reserve(groups.size());
+    for (size_t i = 0; i < groups.size(); ++i) {
+        auto & group = groups[i];
+        const std::string suffix = std::to_string(i + 1);
+        da_auto_chunk_marker marker = {
+            "[[LLAMA_DA_AUTO_START_" + suffix + "]]",
+            "[[LLAMA_DA_AUTO_END_" + suffix + "]]",
+            0,
+            0,
+        };
+        auto & first = auto_inputs.messages[group.first_message];
+        auto & last = auto_inputs.messages[group.after_message - 1];
+        if ((!last.tool_calls.empty() && last.content.empty()) ||
+            first.content.find(marker.start) != std::string::npos || last.content.find(marker.end) != std::string::npos) {
+            return false;
+        }
+        first.content = marker.start + "[Magic Chunk " + suffix + "]\n" + first.content;
+        last.content += marker.end;
+        markers.push_back(std::move(marker));
+    }
+
+    common_chat_params rendered = common_chat_templates_apply(opt.tmpls.get(), auto_inputs);
+    std::vector<std::pair<size_t, size_t>> removals;
+    for (auto & marker : markers) {
+        marker.start_pos = rendered.prompt.find(marker.start);
+        marker.end_pos = rendered.prompt.find(marker.end);
+        if (marker.start_pos == std::string::npos || marker.end_pos == std::string::npos ||
+                rendered.prompt.find(marker.start, marker.start_pos + marker.start.size()) != std::string::npos ||
+                rendered.prompt.find(marker.end, marker.end_pos + marker.end.size()) != std::string::npos ||
+                marker.end_pos <= marker.start_pos) {
+            return false;
+        }
+        removals.emplace_back(marker.start_pos, marker.start.size());
+        removals.emplace_back(marker.end_pos, marker.end.size());
+    }
+
+    auto adjust_pos = [&](size_t pos) {
+        size_t removed = 0;
+        for (const auto & removal : removals) {
+            if (removal.first < pos) {
+                removed += removal.second;
+            }
+        }
+        return pos - removed;
+    };
+
+    std::vector<std::pair<size_t, size_t>> char_ranges;
+    char_ranges.reserve(markers.size());
+    for (const auto & marker : markers) {
+        char_ranges.emplace_back(adjust_pos(marker.start_pos), adjust_pos(marker.end_pos));
+    }
+    std::sort(removals.rbegin(), removals.rend());
+    for (const auto & removal : removals) {
+        rendered.prompt.erase(removal.first, removal.second);
+    }
+
+    const llama_tokens tokens = common_tokenize(vocab, rendered.prompt, true, true);
+    if (tokens.empty() || tokens.size() > (size_t) INT32_MAX) {
+        return false;
+    }
+    std::vector<size_t> offsets(tokens.size() + 1);
+    offsets[0] = 0;
+    std::string detokenized;
+    detokenized.reserve(rendered.prompt.size());
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        detokenized += common_token_to_piece(vocab, tokens[i], true);
+        offsets[i + 1] = detokenized.size();
+    }
+    const size_t drift = detokenized.size() > rendered.prompt.size()
+        ? detokenized.size() - rendered.prompt.size()
+        : rendered.prompt.size() - detokenized.size();
+    if (rendered.prompt.empty() || drift * 100 > rendered.prompt.size()) {
+        return false;
+    }
+
+    for (const auto & range : char_ranges) {
+        const int32_t lo = da_auto_char_to_token(offsets, range.first);
+        const int32_t hi = da_auto_char_to_token(offsets, range.second);
+        if (lo < 0 || hi <= lo) {
+            return false;
+        }
+        da_chunks.emplace_back(lo, hi);
+    }
+
+    inputs = std::move(auto_inputs);
+    chat_params = std::move(rendered);
+    return true;
+}
+
 // used by /chat/completions endpoint
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files)
+    std::vector<raw_buffer> & out_files,
+    const llama_vocab * vocab)
 {
     json llama_params;
 
@@ -1324,7 +1538,15 @@ json oaicompat_chat_params_parse(
     inputs.force_pure_content = opt.force_pure_content;
 
     // Apply chat template to the list of messages
-    auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+    std::vector<std::pair<int32_t, int32_t>> da_auto_chunks;
+    common_chat_params chat_params;
+    const bool has_explicit_da = body.contains("da_chunks") || body.contains("da_filler") ||
+        body.contains("da_rm") || body.contains("da_b");
+    const bool da_auto_applied = !has_explicit_da &&
+        da_auto_chunk_chat(vocab, opt, inputs, chat_params, da_auto_chunks);
+    if (!da_auto_applied) {
+        chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+    }
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;
@@ -1386,6 +1608,15 @@ json oaicompat_chat_params_parse(
         if (!llama_params.contains(item.key()) || item.key() == "n_predict") {
             llama_params[item.key()] = item.value();
         }
+    }
+
+    if (da_auto_applied) {
+        json chunks = json::array();
+        for (const auto & range : da_auto_chunks) {
+            chunks.push_back(json::array({ range.first, range.second }));
+        }
+        llama_params["da_chunks"] = std::move(chunks);
+        llama_params["da_b"] = true;
     }
 
     return llama_params;

@@ -13,6 +13,8 @@ add_library(${TARGET} STATIC
     server-queue.h
     server-common.cpp
     server-common.h
+    da-tag.cpp
+    da-tag.h
     server-context.cpp
     server-context.h
     server-stream.cpp

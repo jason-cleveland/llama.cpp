@@ -68,6 +68,71 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Min chunk size to attempt reusing from the cache via KV shifting. See --cache-reuse arg"));
 
+    add((new field_json("da_rm"))
+        ->set_desc("Declarative attention: prompt token ranges [start, end) to remove from this request's KV attention set")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.da_rm.clear();
+            const auto & ranges = data.at("da_rm");
+            if (!ranges.is_array()) {
+                return;
+            }
+            for (const auto & range : ranges) {
+                if (!range.is_array() || range.size() != 2 ||
+                        !range[0].is_number_integer() || !range[1].is_number_integer()) {
+                    continue;
+                }
+                const int32_t lo = range[0].get<int32_t>();
+                const int32_t hi = range[1].get<int32_t>();
+                if (lo >= 0 && hi > lo) {
+                    ctx.params.da_rm.emplace_back(lo, hi);
+                }
+            }
+        }));
+
+    add((new field_num("da_rm_at", params.da_rm_at))
+        ->set_hard_limits(-1, INT32_MAX)
+        ->set_desc("Apply da_rm after prompt prefill reaches this token position; -1 applies it after the full prompt"));
+
+    add((new field_bool("da_b", params.da_b))
+        ->set_desc("Use a reversible second KV sequence for DA restrictions; requires --kv-unified"));
+
+    add((new field_json("da_chunks"))
+        ->set_desc("Prompt token ranges [start, end), one per chunk; model-emitted focus tags select which chunks remain in attention")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.da_chunks.clear();
+            const auto & chunks = data.at("da_chunks");
+            if (!chunks.is_array()) {
+                return;
+            }
+            for (const auto & chunk : chunks) {
+                if (!chunk.is_array() || chunk.size() != 2 ||
+                        !chunk[0].is_number_integer() || !chunk[1].is_number_integer()) {
+                    continue;
+                }
+                const int32_t lo = chunk[0].get<int32_t>();
+                const int32_t hi = chunk[1].get<int32_t>();
+                if (lo >= 0 && hi > lo) {
+                    ctx.params.da_chunks.emplace_back(lo, hi);
+                }
+            }
+        }));
+
+    add((new field_json("da_filler"))
+        ->set_desc("Prompt token range [start, end) for filler text removed with unselected chunks")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.da_filler = { -1, -1 };
+            const auto & range = data.at("da_filler");
+            if (!range.is_array() || range.size() != 2 ||
+                    !range[0].is_number_integer() || !range[1].is_number_integer()) {
+                return;
+            }
+            const int32_t lo = range[0].get<int32_t>();
+            const int32_t hi = range[1].get<int32_t>();
+            if (lo >= 0 && hi > lo) {
+                ctx.params.da_filler = { lo, hi };
+            }
+        }));
+
     // TODO: implement t_max_prompt_ms
     // add((new field_num("t_max_prompt_ms", params.t_max_prompt_ms))
 

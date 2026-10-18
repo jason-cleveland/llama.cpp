@@ -3646,6 +3646,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_MTMD}).set_env("LLAMA_ARG_JINJA"));
     add_opt(common_arg(
+        {"--da-auto"},
+        {"--no-da-auto"},
+        "automatically chunk older text-only chat turns for model-directed DA (requires --kv-unified)",
+        [](common_params & params, bool value) {
+            params.da_auto = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DA_AUTO"));
+    add_opt(common_arg(
+        {"--da-auto-min-ctx"}, "N",
+        string_format("minimum prompt size for automatic DA chunking (default: %d tokens)", params.da_auto_min_ctx),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("da-auto-min-ctx must be positive");
+            }
+            params.da_auto_min_ctx = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DA_AUTO_MIN_CTX"));
+    add_opt(common_arg(
+        {"--da-auto-chunk-tokens"}, "N",
+        string_format("target size of each automatically generated history chunk (default: %d tokens)", params.da_auto_chunk_tokens),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("da-auto-chunk-tokens must be positive");
+            }
+            params.da_auto_chunk_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DA_AUTO_CHUNK_TOKENS"));
+    add_opt(common_arg(
         {"--reasoning-format"}, "FORMAT",
         "controls whether thought tags are allowed and/or extracted from the response, and in which format they're returned; one of:\n"
         "- none: leaves thoughts unparsed in `message.content`\n"

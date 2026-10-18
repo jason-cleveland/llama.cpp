@@ -1016,6 +1016,10 @@ extern "C" {
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
 
+    // Set the upper bound for finite KV rows in sparse Flash Attention.
+    // Set to 0 to use the dense path.
+    LLAMA_API void llama_set_n_kv_max(struct llama_context * ctx, int64_t n_kv_max);
+
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     //

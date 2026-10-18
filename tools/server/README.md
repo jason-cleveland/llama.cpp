@@ -1299,6 +1299,37 @@ completion = client.completions.create(
 print(completion.choices[0].text)
 ```
 
+### Declarative Attention
+
+Declarative Attention is opt-in per completion request. The client supplies token-position ranges for the prompt; positions are zero-based and ranges use `[start, end)`.
+
+- `da_rm`: ranges to exclude from attention. With `da_rm_at`, apply them after prompt prefill reaches that position; `-1` applies them after the full prompt. This path is irreversible for the request.
+- `da_b`: use a reversible second KV sequence so the model can return to global attention. It requires `--kv-unified`; if no DA sequence is available, the server falls back to `da_rm`.
+- `da_chunks`: ranges for numbered prompt chunks. The server reads model-emitted control tags and restricts attention to the selected chunks.
+- `da_filler`: optional range removed with unselected chunks.
+
+For OpenAI chat requests, the server can build this layout automatically. Start with `--da-auto --kv-unified`; older text-only conversation turns become numbered chunks, while system/developer messages and the newest turn stay in the global scaffold. The model receives an internal instruction to emit DA tags. `--da-auto-min-ctx` sets the activation threshold (default: 8192 tokens), and `--da-auto-chunk-tokens` sets the target size of each chunk (default: 2048 tokens). Requests with explicit DA fields take precedence, and unsupported or ambiguous layouts run without automatic DA.
+
+When `da_chunks` is set, it takes precedence over `da_rm`. The model can emit these tags on a line by themselves (the server recognizes tags only at the start of generated text or after a newline, and removes recognized tags from the response):
+
+- `<focus magic_chunks="N">` keeps chunk `N`; comma-separated numbers keep multiple chunks.
+- `<local>` keeps the prompt scaffold and generated text, but no numbered chunks.
+- `</focus>`, `</local>`, `<global>`, or `</global>` returns to global attention. This is reversible with `da_b`; range removal via `da_rm` cannot restore removed KV.
+
+The client must tokenize the exact rendered prompt and provide matching chunk ranges. The server does not infer chunk boundaries from prompt text. Example request fields:
+
+```json
+{
+  "prompt": "Rendered prompt with numbered chunks and instructions for the model",
+  "da_chunks": [[12, 48], [48, 91]],
+  "da_filler": [91, 113],
+  "da_b": true,
+  "max_tokens": 128
+}
+```
+
+DA changes which KV positions are visible to attention; this server-side port does not add a CUDA sparse-gather kernel.
+
 ### POST `/v1/chat/completions`: OpenAI-compatible Chat Completions API
 
 Given a ChatML-formatted json description in `messages`, it returns the predicted completion. Both synchronous and streaming mode are supported, so scripted and interactive applications work fine. While no strong claims of compatibility with OpenAI API spec is being made, in our experience it suffices to support many apps. Only models with a [supported chat template](https://github.com/ggml-org/llama.cpp/wiki/Templates-supported-by-llama_chat_apply_template) can be used optimally with this endpoint. By default, the ChatML template will be used.
