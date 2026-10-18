@@ -310,6 +310,9 @@ struct server_chat_params {
     std::string reasoning_budget_message;
     std::string media_path;
     bool force_pure_content = false;
+    bool da_auto = false;
+    int32_t da_auto_min_ctx = 8192;
+    int32_t da_auto_chunk_tokens = 2048;
 };
 
 // used by /completions endpoint
@@ -319,7 +322,8 @@ json oaicompat_completion_params_parse(const json & body);
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files);
+    std::vector<raw_buffer> & out_files,
+    const llama_vocab * vocab = nullptr);
 
 // TODO: move it to server-task.cpp
 json format_embeddings_response_oaicompat(

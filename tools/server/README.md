@@ -1308,6 +1308,8 @@ Declarative Attention is opt-in per completion request. The client supplies toke
 - `da_chunks`: ranges for numbered prompt chunks. The server reads model-emitted control tags and restricts attention to the selected chunks.
 - `da_filler`: optional range removed with unselected chunks.
 
+For OpenAI chat requests, the server can build this layout automatically. Start with `--da-auto --kv-unified`; older text-only conversation turns become numbered chunks, while system/developer messages and the newest turn stay in the global scaffold. The model receives an internal instruction to emit DA tags. `--da-auto-min-ctx` sets the activation threshold (default: 8192 tokens), and `--da-auto-chunk-tokens` sets the target size of each chunk (default: 2048 tokens). Requests with explicit DA fields take precedence, and unsupported or ambiguous layouts run without automatic DA.
+
 When `da_chunks` is set, it takes precedence over `da_rm`. The model can emit these tags on a line by themselves (the server recognizes tags only at the start of generated text or after a newline, and removes recognized tags from the response):
 
 - `<focus magic_chunks="N">` keeps chunk `N`; comma-separated numbers keep multiple chunks.

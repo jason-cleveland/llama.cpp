@@ -1498,8 +1498,15 @@ private:
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
                 /* media_path            */ params_base.media_path,
-                /* force_pure_content    */ params_base.force_pure_content_parser
+                /* force_pure_content    */ params_base.force_pure_content_parser,
+                /* da_auto               */ params_base.da_auto && params_base.kv_unified,
+                /* da_auto_min_ctx       */ params_base.da_auto_min_ctx,
+                /* da_auto_chunk_tokens  */ params_base.da_auto_chunk_tokens
             };
+
+            if (params_base.da_auto && !params_base.kv_unified) {
+                SRV_WRN("%s", "--da-auto requires --kv-unified; automatic DA is disabled\n");
+            }
 
             {
                 auto caps = common_chat_templates_get_caps(chat_params.tmpls.get());
@@ -5266,7 +5273,8 @@ void server_routes::init_routes() {
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
-            files);
+            files,
+            ctx_server.vocab);
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -5325,7 +5333,8 @@ void server_routes::init_routes() {
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
-            files);
+            files,
+            ctx_server.vocab);
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -5357,7 +5366,8 @@ void server_routes::init_routes() {
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
-            files);
+            files,
+            ctx_server.vocab);
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -5375,7 +5385,8 @@ void server_routes::init_routes() {
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
-            files);
+            files,
+            ctx_server.vocab);
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -5396,7 +5407,8 @@ void server_routes::init_routes() {
         json data = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
-            files);
+            files,
+            ctx_server.vocab);
         res->ok({{ "prompt", std::move(data.at("prompt")) }});
         return res;
     };
@@ -5845,7 +5857,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const l
     json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
-            files);
+            files,
+            vocab);
     json prompt = body_parsed.at("prompt");
     // SRV_DBG("prompt = %s\n", prompt.dump().c_str());
 

@@ -635,6 +635,9 @@ struct common_params {
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
     bool use_jinja = true;                                                                                  // NOLINT
+    bool da_auto = false;
+    int32_t da_auto_min_ctx = 8192;
+    int32_t da_auto_chunk_tokens = 2048;
 
     // server CORS params
     std::string cors_origins = "*";
