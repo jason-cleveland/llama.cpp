@@ -892,6 +892,8 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    int64_t n_kv_max = 0;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -937,6 +939,10 @@ struct llm_graph_params {
         }
 
         if (n_outputs != other.n_outputs) {
+            return false;
+        }
+
+        if (n_kv_max != other.n_kv_max) {
             return false;
         }
 
@@ -1111,6 +1117,7 @@ struct llm_graph_context {
     const int64_t n_layer_nextn;
     const int64_t n_rot;
     const int64_t n_ctx;       // user-specified context size (can be different from n_ctx_train)
+    const int64_t n_kv_max;
     const int64_t n_head;
     const int64_t n_head_kv;
     const int64_t n_embd_head_k;

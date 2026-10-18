@@ -1818,11 +1818,63 @@ private:
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
 
+        update_da_sparse_bound();
+
         // reset server kill-switch counter
         n_empty_consecutive = 0;
 
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
         return true;
+    }
+
+    int64_t get_da_sparse_bound(const server_slot & slot) const {
+        if (!slot.task || !slot.da_applied) {
+            return 0;
+        }
+
+        const int64_t prompt_tokens = slot.prompt.n_tokens();
+        int64_t removed = slot.n_da_removed;
+        if (slot.da_seq >= 0 && !slot.task->params.da_chunks.empty()) {
+            removed = 0;
+            const auto & chunks = slot.task->params.da_chunks;
+            for (int32_t i = 0; i < (int32_t) chunks.size(); ++i) {
+                if (std::find(slot.da_keep_chunks.begin(), slot.da_keep_chunks.end(), i) == slot.da_keep_chunks.end()) {
+                    const int64_t lo = std::max(chunks[i].first, 0);
+                    const int64_t hi = std::min<int64_t>(chunks[i].second, prompt_tokens - 1);
+                    removed += std::max<int64_t>(0, hi - lo);
+                }
+            }
+            if (slot.task->params.da_filler.first >= 0) {
+                const int64_t lo = std::max(slot.task->params.da_filler.first, 0);
+                const int64_t hi = std::min<int64_t>(slot.task->params.da_filler.second, prompt_tokens - 1);
+                removed += std::max<int64_t>(0, hi - lo);
+            }
+        }
+
+        const int64_t current = std::max<int64_t>(0, prompt_tokens - removed);
+        const int64_t capacity = std::max<int64_t>(0, slot.n_ctx - prompt_tokens);
+        const int64_t remaining = slot.n_predict_max < 0
+            ? capacity
+            : std::min<int64_t>(std::max<int32_t>(0, slot.n_remaining()), capacity);
+        return std::min<int64_t>(slot.n_ctx, current + remaining);
+    }
+
+    void update_da_sparse_bound() {
+        int64_t bound = 0;
+        for (const auto & slot : slots) {
+            if (!slot.is_processing()) {
+                continue;
+            }
+            if (!slot.da_applied) {
+                bound = 0;
+                break;
+            }
+            bound = std::max(bound, get_da_sparse_bound(slot));
+        }
+        if (bound > INT32_MAX) {
+            bound = 0;
+        }
+        llama_set_n_kv_max(ctx_tgt, bound);
     }
 
     bool apply_da_rm(server_slot & slot, const std::vector<std::pair<int32_t, int32_t>> & ranges, int32_t bound) {
@@ -1856,6 +1908,7 @@ private:
 
         slot.da_applied = slot.da_applied || applied;
         slot.da_removed_a = slot.da_removed_a || (applied && slot.da_seq < 0);
+        update_da_sparse_bound();
         return applied;
     }
 
@@ -1932,6 +1985,9 @@ private:
         for (const auto & range : merged) {
             slot.n_da_removed += (uint32_t) (range.second - range.first);
         }
+        if (slot.task->params.da_chunks.empty()) {
+            update_da_sparse_bound();
+        }
         return true;
     }
 
@@ -1981,6 +2037,7 @@ private:
                     }
                     slot.da_keep_chunks = keep;
                     slot.da_mode = DA_MODE_FOCUS;
+                    update_da_sparse_bound();
                     continue;
                 }
 
@@ -2016,6 +2073,7 @@ private:
                 }
                 slot.da_keep_chunks = keep;
                 slot.da_mode = DA_MODE_FOCUS;
+                update_da_sparse_bound();
             } else if (tag.type == 1) {
                 if (slot.da_seq >= 0) {
                     for (int32_t n : slot.da_keep_chunks) {
@@ -2023,6 +2081,7 @@ private:
                     }
                     slot.da_keep_chunks.clear();
                     slot.da_mode = DA_MODE_LOCAL;
+                    update_da_sparse_bound();
                     continue;
                 }
 
@@ -2048,6 +2107,7 @@ private:
                 }
                 slot.da_keep_chunks.clear();
                 slot.da_mode = DA_MODE_LOCAL;
+                update_da_sparse_bound();
             } else {
                 if (slot.da_seq >= 0) {
                     const int32_t n_full = (int32_t) slot.prompt.n_tokens();
@@ -2065,6 +2125,7 @@ private:
                     SLT_WRN(slot, "%s", "da_tag: A mode cannot restore removed KV ranges\n");
                 }
                 slot.da_mode = DA_MODE_GLOBAL;
+                update_da_sparse_bound();
             }
         }
     }

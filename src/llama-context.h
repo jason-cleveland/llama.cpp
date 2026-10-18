@@ -140,6 +140,7 @@ struct llama_context {
     void            set_mtp_chain(uint32_t n_steps);
     const int32_t * get_mtp_chain_ids();
     void set_causal_attn(bool value);
+    void set_n_kv_max(int64_t value);
     void set_warmup(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -303,6 +304,7 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+    int64_t n_kv_max = 0;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

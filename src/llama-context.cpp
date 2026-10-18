@@ -1595,6 +1595,17 @@ void llama_context::set_causal_attn(bool value) {
     sched_need_reserve = true;
 }
 
+void llama_context::set_n_kv_max(int64_t value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, (int) value);
+    GGML_ASSERT(value >= 0 && value <= INT32_MAX);
+
+    if (n_kv_max == value) {
+        return;
+    }
+
+    n_kv_max = value;
+}
+
 void llama_context::set_warmup(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -3008,6 +3019,7 @@ llm_graph_params llama_context::graph_params(
         /*.mtp_chain_embd     =*/mtp_chain_embd,
         /*.samplers    =*/sampling.samplers,
         /*.n_outputs   =*/n_outputs,
+        /*.n_kv_max    =*/n_kv_max,
         /*.cb          =*/graph_get_cb(),
         /*.res         =*/res,
     };
@@ -4273,6 +4285,10 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
+}
+
+void llama_set_n_kv_max(llama_context * ctx, int64_t n_kv_max) {
+    ctx->set_n_kv_max(n_kv_max);
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {

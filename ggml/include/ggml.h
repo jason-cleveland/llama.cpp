@@ -2451,6 +2451,10 @@ extern "C" {
             struct ggml_tensor * a,
             enum ggml_prec       prec);
 
+    GGML_API void ggml_flash_attn_ext_set_n_kv_max(
+            struct ggml_tensor * a,
+            int32_t              n_kv_max);
+
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 

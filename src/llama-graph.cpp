@@ -1537,6 +1537,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_layer_nextn(hparams.n_layer_nextn),
     n_rot(hparams.n_rot()),
     n_ctx(cparams.n_ctx),
+    n_kv_max(params.n_kv_max),
     n_head(hparams.n_head()),
     n_head_kv(hparams.n_head_kv()),
     n_embd_head_k(hparams.n_embd_head_k()),
@@ -2743,6 +2744,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+        ggml_flash_attn_ext_set_n_kv_max(cur, (int32_t) n_kv_max);
 
         if (v_mla) {
 #if 0
