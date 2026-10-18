@@ -6,6 +6,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "da-tag.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -14,6 +15,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "src/llama-cparams.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -195,6 +197,16 @@ struct server_batch {
 struct server_slot {
     int id;
 
+    llama_seq_id da_seq = -1;
+    int32_t da_bound = -1;
+    bool da_applied = false;
+    bool da_removed_a = false;
+    std::vector<int32_t> da_keep_chunks;
+    da_mode_t da_mode = DA_MODE_GLOBAL;
+    size_t da_tag_scan_pos = 0;
+    uint32_t n_da_removed = 0;
+    bool da_rm_pending = false;
+
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
@@ -291,6 +303,10 @@ struct server_slot {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
+        if (da_seq >= 0) {
+            mem.seq_rm(da_seq, -1, -1);
+            da_seq = -1;
+        }
 
         prompt.clear();
     }
@@ -353,6 +369,16 @@ struct server_slot {
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
+
+        da_seq = -1;
+        da_bound = -1;
+        da_applied = false;
+        da_removed_a = false;
+        da_keep_chunks.clear();
+        da_mode = DA_MODE_GLOBAL;
+        da_tag_scan_pos = 0;
+        n_da_removed = 0;
+        da_rm_pending = false;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -425,7 +451,11 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        return !!spec && (!task || (task->params.da_rm.empty() && task->params.da_chunks.empty() && !task->params.da_b));
+    }
+
+    llama_seq_id kv_seq() const {
+        return da_seq >= 0 ? da_seq : (llama_seq_id) id;
     }
 
     void add_token(const completion_token_output & token) {
@@ -472,9 +502,9 @@ struct server_slot {
             i_batch = batch.size();
 
             if (!inp_embd.empty()) {
-                add_ok &= batch.add(id, inp_embd, prompt.tokens.pos_next(), true, false);
+                add_ok &= batch.add(kv_seq(), inp_embd, prompt.tokens.pos_next(), true, false);
             } else {
-                add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true, false);
+                add_ok &= batch.add(kv_seq(), sampled, prompt.tokens.pos_next(), true, false);
             }
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
@@ -492,9 +522,9 @@ struct server_slot {
 
             auto pos0 = prompt.tokens.pos_next();
 
-            add_ok &= batch.add(id, sampled, pos0++, true, false);
+            add_ok &= batch.add(kv_seq(), sampled, pos0++, true, false);
             for (auto token : spec_draft) {
-                add_ok &= batch.add(this->id, token, pos0++, true, false);
+                add_ok &= batch.add(kv_seq(), token, pos0++, true, false);
             }
         }
 
@@ -516,6 +546,15 @@ struct server_slot {
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
+                prompt_clear();
+            } else if (da_seq >= 0) {
+                const int32_t n_full = (int32_t) prompt.n_tokens();
+                if (n_full > da_bound) {
+                    mem.seq_cp(da_seq, id, da_bound, n_full);
+                }
+                mem.seq_rm(da_seq, -1, -1);
+                da_seq = -1;
+            } else if (da_applied) {
                 prompt_clear();
             }
 
@@ -1057,7 +1096,19 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        const int n_da_b_slots = params_base.n_parallel;
+        const int n_da_b_seq_max = 2 * n_da_b_slots;
+        const bool reserve_da_b_sequences = params_base.kv_unified && n_da_b_seq_max <= LLAMA_MAX_SEQ;
+        if (params_base.kv_unified && !reserve_da_b_sequences) {
+            SRV_WRN("cannot reserve DA sequences for %d slots (maximum sequence count is %d)\n", n_da_b_slots, (int) LLAMA_MAX_SEQ);
+        }
+        if (reserve_da_b_sequences) {
+            params_base.n_parallel = n_da_b_seq_max;
+            params_base.n_outputs_max = std::max(params_base.n_outputs_max, n_da_b_seq_max);
+        }
+
         llama_init = common_init_from_params(params_base);
+        params_base.n_parallel = n_da_b_slots;
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1085,6 +1136,11 @@ private:
 
             {
                 common_params params_dft = common_base_params_to_speculative(params_base);
+
+                if (reserve_da_b_sequences) {
+                    params_dft.n_parallel = n_da_b_seq_max;
+                    params_dft.n_outputs_max = std::max(params_dft.n_outputs_max, n_da_b_seq_max);
+                }
 
                 // progress callback
                 params_dft.load_progress_callback           = load_progress_callback;
@@ -1756,6 +1812,7 @@ private:
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+        slot.da_rm_pending = slot.task->params.da_chunks.empty() && !slot.task->params.da_rm.empty();
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -1768,12 +1825,257 @@ private:
         return true;
     }
 
+    bool apply_da_rm(server_slot & slot, const std::vector<std::pair<int32_t, int32_t>> & ranges, int32_t bound) {
+        bound = std::min(bound, (int32_t) slot.prompt.n_tokens());
+        if (bound <= 1) {
+            return false;
+        }
+
+        bool applied = false;
+        for (const auto & range : ranges) {
+            const int32_t lo = std::max(range.first, 0);
+            const int32_t hi = std::min(range.second, bound - 1);
+            if (hi <= lo) {
+                continue;
+            }
+
+            auto * mem_tgt = llama_get_memory(ctx_tgt);
+            if (!mem_tgt || !llama_memory_seq_rm(mem_tgt, slot.kv_seq(), lo, hi)) {
+                SLT_WRN(slot, "da_rm: failed to remove range [%d, %d)\n", lo, hi);
+                return applied;
+            }
+            if (ctx_dft) {
+                auto * mem_dft = llama_get_memory(ctx_dft);
+                if (mem_dft && !llama_memory_seq_rm(mem_dft, slot.kv_seq(), lo, hi)) {
+                    SLT_WRN(slot, "da_rm: failed to remove draft range [%d, %d)\n", lo, hi);
+                }
+            }
+            slot.n_da_removed += (uint32_t) (hi - lo);
+            applied = true;
+        }
+
+        slot.da_applied = slot.da_applied || applied;
+        slot.da_removed_a = slot.da_removed_a || (applied && slot.da_seq < 0);
+        return applied;
+    }
+
+    bool apply_da_b(server_slot & slot, const std::vector<std::pair<int32_t, int32_t>> & ranges, int32_t bound) {
+        bound = std::min(bound, (int32_t) slot.prompt.n_tokens());
+        if (bound <= 1 || !params_base.kv_unified) {
+            SLT_WRN(slot, "%s", "da_b: requires a non-empty prompt and --kv-unified; falling back to da_rm\n");
+            return apply_da_rm(slot, ranges, bound);
+        }
+
+        const int n_slots = (int) slots.size();
+        const int n_seq_max = (int) llama_n_seq_max(ctx_tgt);
+        llama_seq_id da_seq = -1;
+        for (int i = n_slots; i < n_seq_max; ++i) {
+            bool taken = false;
+            for (const auto & other : slots) {
+                if (other.is_processing() && other.da_seq == i) {
+                    taken = true;
+                    break;
+                }
+            }
+            if (!taken) {
+                da_seq = (llama_seq_id) i;
+                break;
+            }
+        }
+        if (da_seq < 0) {
+            SLT_WRN(slot, "%s", "da_b: no spare sequence id; falling back to da_rm\n");
+            return apply_da_rm(slot, ranges, bound);
+        }
+
+        std::vector<std::pair<int32_t, int32_t>> removed;
+        for (const auto & range : ranges) {
+            const int32_t lo = std::max(range.first, 0);
+            const int32_t hi = std::min(range.second, bound - 1);
+            if (hi > lo) {
+                removed.emplace_back(lo, hi);
+            }
+        }
+        std::sort(removed.begin(), removed.end());
+        std::vector<std::pair<int32_t, int32_t>> merged;
+        for (const auto & range : removed) {
+            if (!merged.empty() && range.first <= merged.back().second) {
+                merged.back().second = std::max(merged.back().second, range.second);
+            } else {
+                merged.push_back(range);
+            }
+        }
+
+        std::vector<std::pair<int32_t, int32_t>> keep;
+        int32_t pos = 0;
+        for (const auto & range : merged) {
+            if (range.first > pos) {
+                keep.emplace_back(pos, range.first);
+            }
+            pos = std::max(pos, range.second);
+        }
+        if (pos < bound) {
+            keep.emplace_back(pos, bound);
+        }
+        if (keep.empty() || merged.empty()) {
+            return false;
+        }
+
+        for (const auto & range : keep) {
+            slot.mem.seq_cp(slot.id, da_seq, range.first, range.second);
+        }
+
+        slot.da_seq = da_seq;
+        slot.da_bound = bound;
+        slot.da_applied = true;
+        slot.da_removed_a = false;
+        slot.n_da_removed = 0;
+        for (const auto & range : merged) {
+            slot.n_da_removed += (uint32_t) (range.second - range.first);
+        }
+        return true;
+    }
+
+    void apply_da_tag(server_slot & slot) {
+        const auto & chunks = slot.task->params.da_chunks;
+        if (chunks.empty()) {
+            return;
+        }
+
+        for (;;) {
+            const da_tag_t tag = scan_da_tag(slot.generated_text, slot.da_tag_scan_pos);
+            if (tag.type < 0) {
+                slot.da_tag_scan_pos = slot.generated_text.size() > 64 ? slot.generated_text.size() - 64 : 0;
+                return;
+            }
+
+            const size_t erased = tag.end - tag.start;
+            slot.generated_text.erase(tag.start, erased);
+            if (slot.n_sent_text > tag.start) {
+                slot.n_sent_text = slot.n_sent_text >= tag.end ? slot.n_sent_text - erased : tag.start;
+            }
+            slot.da_tag_scan_pos = tag.start;
+
+            if (tag.type == 0) {
+                std::vector<int32_t> keep;
+                for (int32_t n : tag.keep_nums) {
+                    if (n > 0 && n <= (int32_t) chunks.size() &&
+                            std::find(keep.begin(), keep.end(), n - 1) == keep.end()) {
+                        keep.push_back(n - 1);
+                    }
+                }
+                std::sort(keep.begin(), keep.end());
+                if (keep.empty()) {
+                    continue;
+                }
+
+                if (slot.da_seq >= 0) {
+                    for (int32_t n : slot.da_keep_chunks) {
+                        if (std::find(keep.begin(), keep.end(), n) == keep.end()) {
+                            slot.mem.seq_rm(slot.da_seq, chunks[n].first, chunks[n].second);
+                        }
+                    }
+                    for (int32_t n : keep) {
+                        if (std::find(slot.da_keep_chunks.begin(), slot.da_keep_chunks.end(), n) == slot.da_keep_chunks.end()) {
+                            slot.mem.seq_cp(slot.id, slot.da_seq, chunks[n].first, chunks[n].second);
+                        }
+                    }
+                    slot.da_keep_chunks = keep;
+                    slot.da_mode = DA_MODE_FOCUS;
+                    continue;
+                }
+
+                std::vector<int32_t> present;
+                if (!slot.da_applied) {
+                    for (int32_t n = 0; n < (int32_t) chunks.size(); ++n) {
+                        present.push_back(n);
+                    }
+                } else {
+                    present = slot.da_keep_chunks;
+                }
+                const bool can_keep = std::all_of(keep.begin(), keep.end(), [&](int32_t n) {
+                    return std::find(present.begin(), present.end(), n) != present.end();
+                });
+                if (!can_keep) {
+                    SLT_WRN(slot, "%s", "da_tag: A mode cannot restore a previously removed chunk\n");
+                    continue;
+                }
+
+                std::vector<std::pair<int32_t, int32_t>> remove;
+                for (int32_t n : present) {
+                    if (std::find(keep.begin(), keep.end(), n) == keep.end()) {
+                        remove.push_back(chunks[n]);
+                    }
+                }
+                if (!slot.da_applied && slot.task->params.da_filler.first >= 0) {
+                    remove.push_back(slot.task->params.da_filler);
+                }
+                if (slot.task->params.da_b) {
+                    apply_da_b(slot, remove, (int32_t) slot.prompt.n_tokens());
+                } else {
+                    apply_da_rm(slot, remove, (int32_t) slot.prompt.n_tokens());
+                }
+                slot.da_keep_chunks = keep;
+                slot.da_mode = DA_MODE_FOCUS;
+            } else if (tag.type == 1) {
+                if (slot.da_seq >= 0) {
+                    for (int32_t n : slot.da_keep_chunks) {
+                        slot.mem.seq_rm(slot.da_seq, chunks[n].first, chunks[n].second);
+                    }
+                    slot.da_keep_chunks.clear();
+                    slot.da_mode = DA_MODE_LOCAL;
+                    continue;
+                }
+
+                std::vector<int32_t> present;
+                if (!slot.da_applied) {
+                    for (int32_t n = 0; n < (int32_t) chunks.size(); ++n) {
+                        present.push_back(n);
+                    }
+                } else {
+                    present = slot.da_keep_chunks;
+                }
+                std::vector<std::pair<int32_t, int32_t>> remove;
+                for (int32_t n : present) {
+                    remove.push_back(chunks[n]);
+                }
+                if (!slot.da_applied && slot.task->params.da_filler.first >= 0) {
+                    remove.push_back(slot.task->params.da_filler);
+                }
+                if (slot.task->params.da_b) {
+                    apply_da_b(slot, remove, (int32_t) slot.prompt.n_tokens());
+                } else {
+                    apply_da_rm(slot, remove, (int32_t) slot.prompt.n_tokens());
+                }
+                slot.da_keep_chunks.clear();
+                slot.da_mode = DA_MODE_LOCAL;
+            } else {
+                if (slot.da_seq >= 0) {
+                    const int32_t n_full = (int32_t) slot.prompt.n_tokens();
+                    if (n_full > slot.da_bound) {
+                        slot.mem.seq_cp(slot.da_seq, slot.id, slot.da_bound, n_full);
+                    }
+                    slot.mem.seq_rm(slot.da_seq, -1, -1);
+                    slot.da_seq = -1;
+                    slot.da_bound = -1;
+                    slot.da_applied = false;
+                    slot.da_removed_a = false;
+                    slot.n_da_removed = 0;
+                    slot.da_keep_chunks.clear();
+                } else if (slot.da_removed_a) {
+                    SLT_WRN(slot, "%s", "da_tag: A mode cannot restore removed KV ranges\n");
+                }
+                slot.da_mode = DA_MODE_GLOBAL;
+            }
+        }
+    }
+
     bool process_token(completion_token_output & result, server_slot & slot) {
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
         slot.sampled = result.tok;
 
         slot.generated_text += token_str;
+        apply_da_tag(slot);
         if (slot.task->params.return_tokens) {
             slot.generated_tokens.push_back(result.tok);
         }
@@ -1803,7 +2105,12 @@ private:
             // check if there is any token to predict
             if (send_text) {
                 // no send the stop word in the response
-                result.text_to_send = slot.generated_text.substr(pos, std::string::npos);
+                const size_t n_text = slot.generated_text.size() - pos;
+                const size_t n_hold = slot.task->params.da_chunks.empty()
+                    ? 0
+                    : da_tag_hold_len(slot.generated_text.substr(pos));
+                const size_t n_send = n_text > n_hold ? n_text - n_hold : 0;
+                result.text_to_send = slot.generated_text.substr(pos, n_send);
                 slot.n_sent_text += result.text_to_send.size();
                 // add the token to slot queue and cache
             } else {
@@ -2883,8 +3190,8 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
-                slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
-                slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
+                slot.mem.seq_rm (slot.kv_seq(), n_keep            , n_keep + n_discard);
+                slot.mem.seq_add(slot.kv_seq(), n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
 
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
@@ -3376,7 +3683,19 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    if (slot.da_rm_pending && slot.task->params.da_rm_at >= 0 && !slot.task->tokens.has_mtmd) {
+                        const int32_t bound = std::min(slot.task->params.da_rm_at, slot.task->n_tokens());
+                        if (slot.prompt.n_tokens() >= (size_t) bound) {
+                            if (slot.task->params.da_b) {
+                                apply_da_b(slot, slot.task->params.da_rm, bound);
+                            } else {
+                                apply_da_rm(slot, slot.task->params.da_rm, bound);
+                            }
+                            slot.da_rm_pending = false;
+                        }
+                    }
+
+                    slot.mem.seq_rm(slot.kv_seq(), p0, -1);
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
@@ -3457,6 +3776,11 @@ private:
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                        if (slot.da_rm_pending && slot.task->params.da_rm_at >= 0 && !slot.task->tokens.has_mtmd &&
+                                slot.prompt.n_tokens() >= (size_t) std::min(slot.task->params.da_rm_at, slot.task->n_tokens())) {
+                            break;
+                        }
+
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -3474,7 +3798,7 @@ private:
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
-                        add_ok &= batch.add(slot.id,
+                        add_ok &= batch.add(slot.kv_seq(),
                             cur_tok,
                             /* pos       = */ slot.prompt.tokens.pos_next(),
                             /* output    = */ slot.need_embd(),
@@ -3763,6 +4087,18 @@ private:
             }
 
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                if (slot.da_rm_pending) {
+                    const int32_t bound = slot.task->params.da_rm_at >= 0
+                        ? std::min(slot.task->params.da_rm_at, slot.task->n_tokens())
+                        : slot.task->n_tokens();
+                    if (slot.task->params.da_b) {
+                        apply_da_b(slot, slot.task->params.da_rm, bound);
+                    } else {
+                        apply_da_rm(slot, slot.task->params.da_rm, bound);
+                    }
+                    slot.da_rm_pending = false;
+                }
+
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
                     send_embedding(slot, batch_view);
